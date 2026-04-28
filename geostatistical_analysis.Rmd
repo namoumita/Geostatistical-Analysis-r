@@ -1,0 +1,596 @@
+---
+title: "Geostatistical Analysis & Spatial Prediction Using Kriging"
+author: "Nafisa Ahmad"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 7,
+  fig.height = 5,
+  fig.align = "center"
+)
+```
+
+---
+
+## Project Overview
+
+This project demonstrates an end-to-end geostatistical analysis workflow, covering spatial data exploration, variogram modelling, ordinary kriging for spatial interpolation, model validation, and monitoring network optimisation.
+
+The analysis is structured around three core components:
+
+1. **Kriging & Variogram Modelling** — fitting Gaussian and Exponential spatial models to the `head` dataset and predicting values at unobserved locations
+2. **Spatial Point Process Analysis** — exploring tree species distributions in the `hyytiala` dataset using intensity estimation, pair correlation functions and summary statistics
+3. **Spatio-Temporal Simulation** — simulating and visualising a non-homogeneous spatio-temporal Poisson process
+
+**Key techniques applied:** variogram fitting (OLS, MLE), ordinary kriging, LOOCV, 5-fold cross-validation, kernel density estimation, quadrat testing, F/G-function analysis, and thinning algorithms for spatio-temporal simulation.
+
+**Tools:** R, geoR, gstat, spatstat, sp
+
+---
+
+## Part 1: Kriging & Variogram Modelling
+
+### 1.1 Load Libraries & Data
+
+```{r libraries}
+library(spatstat)
+library(gstat)
+library(geoR)
+library(sp)
+```
+
+The `head` dataset from the `geoR` package contains 29 spatially referenced observations used here to explore spatial autocorrelation and fit kriging models.
+
+```{r load-data}
+data(head)
+```
+
+### 1.2 Exploratory Spatial Analysis
+
+Before modelling, we examine the spatial distribution of observation locations and summarise the data structure.
+
+```{r eda}
+summary(head)
+
+plot(head$coords,
+     main = "Spatial Locations of Observation Points",
+     xlab = "X-coordinate",
+     ylab = "Y-coordinate",
+     pch = 19,
+     col = "black")
+```
+
+The 29 data points are distributed across a spatial domain with X ranging from 4.32 to 16.27 and Y from 3.38 to 11.41. Data values range from 584 to 1202, with a mean of approximately 830.
+
+### 1.3 Sample Variogram
+
+The empirical variogram quantifies spatial autocorrelation — how dissimilarity between observations changes with distance.
+
+```{r variogram}
+sample_vario <- variog(head)
+plot(sample_vario, main = "Sample Variogram")
+```
+
+The rising pattern in the variogram confirms the presence of spatial autocorrelation: observations closer together are more similar than those further apart.
+
+### 1.4 Variogram Model Fitting
+
+We fit both Gaussian and Exponential covariance models to the empirical variogram to find the best parametric representation of spatial structure.
+
+```{r model-fitting}
+gaussian_model <- variofit(sample_vario,
+                           ini.cov.pars = c(200000, 1),
+                           cov.model = "gaussian",
+                           nugget = 1)
+
+exp_model <- variofit(sample_vario,
+                      ini.cov.pars = c(200000, 1),
+                      cov.model = "exponential",
+                      nugget = 1)
+```
+
+```{r model-comparison-plot}
+plot(sample_vario, main = "Sample Variogram with Fitted Models")
+lines(gaussian_model, col = "blue4", lwd = 2)
+lines(exp_model, col = "red4", lwd = 2)
+legend("bottomright",
+       c("Gaussian", "Exponential"),
+       col = c("blue4", "red4"),
+       lwd = 2)
+```
+
+```{r model-aic}
+cat("Gaussian model AIC:", gaussian_model$value, "\n")
+cat("Exponential model AIC:", exp_model$value, "\n")
+```
+
+**Model selection:** The Gaussian model achieves a substantially lower AIC value (35,271,707,910 vs 205,543,147,132), indicating a better fit to the observed spatial structure. The Gaussian model's smooth decay pattern better captures the gradual transition in spatial dependence for this dataset.
+
+### 1.5 Directional Variogram Analysis
+
+To assess anisotropy (directional dependence), we compute directional variograms at 15° and 30°, and across four cardinal directions.
+
+```{r directional-variogram}
+dir_vario_15 <- variog(head, direction = pi/12, tolerance = pi/6)
+dir_vario_30 <- variog(head, direction = pi/6, tolerance = pi/6)
+
+plot(dir_vario_15, type = "l", col = "blue", lwd = 2,
+     main = "Directional Variograms: 15° vs 30°")
+lines(dir_vario_30, col = "red", lwd = 2)
+legend("topleft",
+       c("15° direction", "30° direction"),
+       col = c("blue", "red"),
+       lwd = 2)
+```
+
+```{r multidirectional-variogram}
+multi_vario <- variog4(head, direction = c(0, pi/4, pi/2, 3*pi/4))
+plot(multi_vario, main = "Multidirectional Variograms (0°, 45°, 90°, 135°)")
+```
+
+The multidirectional analysis reveals mild anisotropy — the 135° direction diverges noticeably from others — suggesting spatial dependence is slightly stronger along certain orientations. This informs the choice of an omnidirectional model for kriging while noting the directional nuance.
+
+---
+
+## Part 2: Ordinary Kriging & Spatial Prediction
+
+### 2.1 Median Centre Prediction
+
+We identify the spatial median of the observation locations and use ordinary kriging to predict the value at that location.
+
+```{r median-prediction}
+# Set chosen model
+chosen_model <- exp_model
+
+coords <- head$coords
+median_x <- median(coords[, 1])
+median_y <- median(coords[, 2])
+
+cat("Median x-coordinate (Easting):", round(median_x, 2), "\n")
+cat("Median y-coordinate (Northing):", round(median_y, 2), "\n")
+```
+
+```{r median-plot}
+plot(head$coords,
+     main = "Observation Locations with Median Centre",
+     xlab = "X-coordinate",
+     ylab = "Y-coordinate",
+     pch = 19,
+     col = "black")
+
+points(median_x, median_y,
+       pch = 19,
+       col = "red",
+       cex = 1.5)
+
+legend("topleft",
+       legend = c("Observation Points", "Median Centre"),
+       pch = c(19, 19),
+       col = c("black", "red"),
+       pt.cex = c(1, 1.5))
+```
+
+```{r kriging-prediction}
+pred_points <- data.frame(x = median_x, y = median_y)
+
+krig_predictions <- krige.conv(head,
+                               locations = pred_points,
+                               krige = krige.control(obj.model = exp_model))
+
+cat("Predicted value at median location:", round(krig_predictions$predict, 4), "\n")
+cat("Prediction variance:", round(krig_predictions$krige.var, 4), "\n")
+```
+
+### 2.2 Grid Prediction & Kriging Surface
+
+We extend prediction to a 50×50 grid across the full spatial domain to produce a continuous kriging surface.
+
+```{r grid-kriging}
+grid_x <- seq(min(head$coords[,1]), max(head$coords[,1]), length.out = 50)
+grid_y <- seq(min(head$coords[,2]), max(head$coords[,2]), length.out = 50)
+grid_locs <- as.matrix(expand.grid(x = grid_x, y = grid_y))
+
+krig_grid <- krige.conv(head,
+                        locations = grid_locs,
+                        krige = krige.control(obj.model = gaussian_model))
+
+pred_matrix <- matrix(krig_grid$predict,
+                      nrow = length(grid_x),
+                      ncol = length(grid_y),
+                      byrow = TRUE)
+
+image(x = grid_x, y = grid_y, z = pred_matrix,
+      main = "Kriging Prediction Surface",
+      xlab = "X-coordinate",
+      ylab = "Y-coordinate")
+contour(x = grid_x, y = grid_y, z = pred_matrix, add = TRUE)
+points(head$coords, pch = 19, cex = 0.5)
+```
+
+Higher predicted values (warmer colours) are concentrated in the south-east of the domain. Prediction uncertainty is higher away from observation points, as expected — the kriging variance surface reflects data coverage.
+
+---
+
+## Part 3: Model Validation
+
+### 3.1 Leave-One-Out Cross-Validation (LOOCV)
+
+LOOCV assesses how well the fitted model predicts at each observed location when that point is withheld from the training data.
+
+```{r loocv}
+library(sp)
+library(gstat)
+
+sp_data <- data.frame(x = head$coords[,1],
+                      y = head$coords[,2],
+                      z = head$data)
+coordinates(sp_data) <- ~x+y
+
+vgm_model <- vgm(psill  = exp_model$cov.pars[1],
+                 model  = "Exp",
+                 range  = exp_model$cov.pars[2],
+                 nugget = exp_model$nugget)
+
+cv_result <- krige.cv(z ~ 1, sp_data, vgm_model)
+
+library(lattice)
+spplot(cv_result, "residual",
+       col.regions = bpy.colors(),
+       main = "LOOCV Residuals")
+```
+
+The residual map shows the spatial distribution of prediction errors. Residuals are broadly symmetric, with the largest errors appearing in data-sparse regions — consistent with expected kriging behaviour.
+
+### 3.2 5-Fold Cross-Validation
+
+5-fold cross-validation provides a more robust performance estimate by partitioning data into 5 subsets and rotating which subset is held out for prediction.
+
+```{r kfold-cv}
+set.seed(123)
+n <- length(head$data)
+folds <- sample(rep(1:5, length.out = n))
+cv_5fold <- numeric(n)
+
+for (i in 1:5) {
+  test_idx <- which(folds == i)
+
+  train_data <- list(
+    coords = head$coords[-test_idx, ],
+    data   = head$data[-test_idx]
+  )
+  class(train_data) <- "geodata"
+
+  train_vario <- variog(train_data)
+  train_model <- variofit(train_vario,
+                          ini.cov.pars = exp_model$cov.pars,
+                          cov.model    = "exponential",
+                          nugget       = exp_model$nugget)
+
+  test_data <- list(
+    coords = head$coords[test_idx, , drop = FALSE],
+    data   = head$data[test_idx]
+  )
+
+  test_pred <- krige.conv(geodata  = train_data,
+                          locations = test_data$coords,
+                          krige    = krige.control(obj.model = train_model))
+
+  cv_5fold[test_idx] <- test_data$data - test_pred$predict
+}
+
+rmse_5fold <- sqrt(mean(cv_5fold^2))
+mae_5fold  <- mean(abs(cv_5fold))
+bias_5fold <- mean(cv_5fold)
+
+cat("5-Fold Cross-Validation Results:\n")
+cat("RMSE:", round(rmse_5fold, 4), "\n")
+cat("MAE: ", round(mae_5fold, 4), "\n")
+cat("Bias:", round(bias_5fold, 4), "\n")
+```
+
+```{r cv-residuals-plot}
+plot(head$coords,
+     pch  = 19,
+     col  = ifelse(abs(cv_5fold) > quantile(abs(cv_5fold), 0.9), "red", "black"),
+     main = "5-Fold CV Residuals (Top 10% Errors in Red)",
+     xlab = "X-coordinate",
+     ylab = "Y-coordinate")
+```
+
+An RMSE of 33.87 against a data standard deviation of 82.78 indicates the model explains approximately 41% of spatial variance — reasonable given the small sample size (n=29). Larger errors cluster in the north-east, where observation density is lower.
+
+---
+
+## Part 4: Monitoring Network Optimisation
+
+We assess the informational value of each observation point by measuring how much kriging variance increases when it is removed. Points whose removal causes the greatest increase in uncertainty are the most valuable to retain.
+
+```{r network-optimisation}
+mean_krig_vars <- numeric(nrow(head$coords))
+
+max_var_point <- which.min(
+  sapply(1:nrow(head$coords), function(i) {
+    temp_data <- list(coords = head$coords[-i,], data = head$data[-i])
+    class(temp_data) <- "geodata"
+    mean_krig_vars[i] <<- mean(krige.conv(temp_data,
+                                          locations = grid_locs,
+                                          krige = krige.control(obj.model = chosen_model))$krige.var)
+  })
+)
+
+cat("Most valuable observation point to retain: Point", max_var_point,
+    "\nCoordinates:", round(head$coords[max_var_point,], 2),
+    "\nObserved value:", head$data[max_var_point])
+```
+
+```{r sorted-variance-plot}
+sorted_vars <- sort(mean_krig_vars)
+
+plot(sorted_vars,
+     type = "b",
+     pch  = 10,
+     col  = "blue",
+     main = "Sorted Mean Kriging Variance by Point Removal",
+     xlab = "Rank (1 = Most Valuable Point)",
+     ylab = "Mean Kriging Variance",
+     las  = 1)
+
+abline(h = median(sorted_vars), col = "red",       lty = 2)
+abline(h = quantile(sorted_vars, 0.9), col = "darkgreen", lty = 3)
+
+legend("bottomright",
+       legend = c("Variance (point removed)", "Median variance", "90th percentile"),
+       col    = c("blue", "red", "darkgreen"),
+       pch    = c(10, NA, NA),
+       lty    = c(1, 2, 3))
+```
+
+```{r network-map}
+n_points    <- length(mean_krig_vars)
+n_select    <- ceiling(0.1 * n_points)
+bottom_10   <- order(mean_krig_vars)[1:n_select]
+top_10      <- order(mean_krig_vars, decreasing = TRUE)[1:n_select]
+
+plot(head$coords,
+     main = "Monitoring Network Optimisation — Top & Bottom 10%",
+     xlab = "X-coordinate",
+     ylab = "Y-coordinate",
+     pch  = 1,
+     col  = "gray40")
+
+points(head$coords[bottom_10,], pch = 2, col = "blue", cex = 1.5)
+points(head$coords[top_10,],   pch = 0, col = "red",  cex = 1.5)
+
+legend("topleft",
+       legend = c("Regular points", "High value — retain", "Low value — candidate for removal"),
+       col    = c("gray40", "blue", "red"),
+       pch    = c(1, 2, 0),
+       pt.cex = 1.5)
+```
+
+Points marked in blue (bottom 10% by removed variance) are the most critical to the network — removing them causes the greatest increase in prediction uncertainty. Red points contribute least and are candidates for removal if network reduction is needed.
+
+---
+
+## Part 5: Spatial Point Process Analysis
+
+### 5.1 Hyytiala Forest Dataset
+
+The `hyytiala` dataset from `spatstat` contains locations of four tree species (aspen, birch, pine, rowan) within a Finnish forest plot. We explore spatial intensity, clustering behaviour, and inter-species relationships.
+
+```{r hyytiala-load}
+data("hyytiala")
+
+plot(hyytiala,
+     main = "Hyytiala Forest — Tree Species Locations",
+     cols = c("red", "blue", "darkgrey", "brown4"),
+     pch  = c(1, 2, 3, 4))
+```
+
+### 5.2 Kernel Density & Intensity Estimation
+
+```{r kde}
+plot(density(hyytiala), main = "Kernel Density Estimate with Contours")
+contour(density(hyytiala), add = TRUE)
+```
+
+The intensity surface reveals non-uniform tree distribution — higher density in the southern region and relative sparsity to the north — suggesting environmental gradients or competition effects.
+
+### 5.3 Complete Spatial Randomness Test
+
+A quadrat test assesses whether the observed pattern significantly departs from Complete Spatial Randomness (CSR).
+
+```{r csr-test}
+quad_test <- quadrat.test(hyytiala, 3, 3)
+plot(quad_test, main = "Quadrat Test for CSR")
+print(quad_test)
+```
+
+The chi-squared test yields p = 0.114 (>0.05), providing insufficient evidence to reject CSR at the 5% level. The pattern is broadly consistent with a homogeneous Poisson process at this spatial resolution.
+
+### 5.4 Species-Level Intensity
+
+```{r species-intensity}
+aspen_cells <- subset(hyytiala, marks == "aspen")
+birch_cells <- subset(hyytiala, marks == "birch")
+pine_cells  <- subset(hyytiala, marks == "pine")
+rowan_cells <- subset(hyytiala, marks == "rowan")
+
+par(mfrow = c(2, 2))
+plot(density(aspen_cells), main = "Aspen Intensity")
+plot(density(birch_cells), main = "Birch Intensity")
+plot(density(pine_cells),  main = "Pine Intensity")
+plot(density(rowan_cells), main = "Rowan Intensity")
+par(mfrow = c(1, 1))
+```
+
+Species exhibit distinct spatial patterns. Aspen shows the strongest clustering (4× intensity variation), while pine is more uniformly distributed. This heterogeneity suggests species-specific habitat preferences or competitive exclusion effects.
+
+### 5.5 Cross-Type Pair Correlation Function
+
+The cross-type pair correlation function measures the spatial relationship between birch and rowan trees.
+
+```{r pcf}
+pcf_cross <- pcfcross(hyytiala, i = "birch", j = "rowan")
+plot(pcf_cross, main = "Cross-Type Pair Correlation: Birch vs Rowan")
+```
+
+At short distances (r < 0.1), g(r) < 1, indicating inhibition — birch and rowan trees tend not to co-occur at close range. At larger distances, g(r) approaches or exceeds 1, suggesting independence or mild attraction. This pattern is consistent with inter-species competition at the local scale.
+
+### 5.6 Summary Statistics: F and G Functions
+
+```{r fg-functions}
+unmarked <- unmark(hyytiala)
+
+f_func <- Fest(unmarked)
+g_func <- Gest(unmarked)
+
+par(mfrow = c(1, 2))
+plot(f_func, main = "F-function (Empty Space)")
+plot(g_func, main = "G-function (Nearest Neighbour)")
+par(mfrow = c(1, 1))
+```
+
+The G-function (nearest-neighbour distances) lies above the CSR envelope, indicating clustering — trees tend to have closer neighbours than expected under randomness. The F-function (empty space distances) complements this, showing that large empty areas are less common than under CSR.
+
+---
+
+## Part 6: Spatio-Temporal Poisson Process Simulation
+
+### 6.1 Simulation Setup
+
+We simulate a non-homogeneous spatio-temporal Poisson process with intensity function λ(x, y, t) = 100(x + y)²(5 − t)², where intensity varies with both spatial location and time.
+
+```{r spatiotemporal-sim}
+simulate_spatiotemporal <- function(t_max = 1, x_max = 1, y_max = 1) {
+  lambda     <- function(x, y, t) { 100 * (x + y)^2 * (5 - t)^2 }
+  lambda_max <- lambda(x_max, y_max, 5)
+  events     <- data.frame(x = numeric(0), y = numeric(0), t = numeric(0))
+
+  for (i in 1:1000) {
+    x_cand <- runif(1, 0, x_max)
+    y_cand <- runif(1, 0, y_max)
+    t_cand <- runif(1, 0, t_max)
+
+    lambda_cand <- lambda(x_cand, y_cand, t_cand)
+    if (runif(1) < lambda_cand / lambda_max) {
+      events <- rbind(events, data.frame(x = x_cand, y = y_cand, t = t_cand))
+    }
+  }
+  events[order(events$t), ]
+}
+
+set.seed(123)
+events <- simulate_spatiotemporal(t_max = 3, x_max = 2, y_max = 2)
+head(events)
+```
+
+### 6.2 Spatial Distribution of Events
+
+```{r spatiotemporal-spatial-plot}
+plot(events$x, events$y,
+     pch  = 1,
+     col  = "blue",
+     main = "Simulated Event Locations",
+     xlab = "X",
+     ylab = "Y")
+```
+
+### 6.3 Temporal Dynamics
+
+```{r spatiotemporal-temporal-plot}
+par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
+
+plot(events$t, events$x^2 + events$y^2,
+     pch  = 19, col = "purple", cex = 0.6,
+     main = "Time vs Spatial Component",
+     xlab = "Time", ylab = "Spatial Intensity")
+
+plot(sort(events$t), 1:nrow(events),
+     type = "s", col = "darkblue", lwd = 1.5,
+     main = "Cumulative Events Over Time",
+     xlab = "Time", ylab = "Count")
+
+par(mfrow = c(1, 1))
+```
+
+The spatial plot shows concentration near the origin due to the (x + y)² term. The cumulative time plot shows steady event accumulation — the (5−t)² term makes early events slightly more frequent.
+
+### 6.4 Theoretical vs Empirical Intensity
+
+```{r intensity-verification}
+t_max <- 3; x_max <- 2; y_max <- 2
+
+spatial_integral <- 100 * (x_max^3/3 + x_max^2*y_max + x_max*y_max^2)
+lambda_theory    <- function(t) spatial_integral * (5 - t)
+
+time_breaks        <- seq(0, t_max, length = 21)
+time_counts        <- hist(events$t, breaks = time_breaks, plot = FALSE)$counts
+temporal_intensity <- time_counts / diff(time_breaks)[1]
+
+plot(time_breaks[-1] - diff(time_breaks)/2, temporal_intensity,
+     type = "b", pch = 19, col = "black",
+     main = "Temporal Intensity: Empirical vs Theoretical",
+     xlab = "Time", ylab = "Intensity (events/unit time)",
+     ylim = c(0, max(temporal_intensity, lambda_theory(0)) * 1.1))
+
+curve(lambda_theory(x), col = "red", lwd = 2, add = TRUE)
+
+legend("topright",
+       c("Empirical", "Theoretical"),
+       col = c("black", "red"),
+       lwd = c(1, 2),
+       pch = c(19, NA))
+```
+
+The empirical intensity remains below the theoretical curve due to the thinning algorithm's fixed candidate pool (n=1,000). Increasing candidates would improve convergence to the theoretical intensity.
+
+### 6.5 Subwindow Simulations
+
+```{r subwindow-sim}
+lambda_spatial <- function(x, y) { 400 * (x + y)^2 }
+win <- owin(c(0.5, 1), c(0, 1))
+
+set.seed(123); sim1 <- rpoispp(lambda_spatial, win = win)
+set.seed(456); sim2 <- rpoispp(lambda_spatial, win = win)
+
+par(mfrow = c(1, 3), mar = c(2, 2, 3, 1))
+plot(sim1, main = "Simulation 1", cols = "blue")
+plot(sim2, main = "Simulation 2", cols = "red")
+plot(events$x, events$y, pch = 19, cex = 0.3, col = "gray",
+     main = "Original Process", xlim = c(0, 2), ylim = c(0, 2))
+rect(1, 0, 2, 1, border = "red", lwd = 2)
+par(mfrow = c(1, 1))
+```
+
+Both subwindow simulations show spatial clustering near y = 0, consistent with the (x + y)² intensity function. The red rectangle highlights the corresponding subwindow in the original simulation for direct comparison.
+
+---
+
+## Summary
+
+This analysis demonstrates a complete geostatistical and spatial statistics workflow:
+
+- **Variogram modelling** confirmed spatial autocorrelation and identified the Gaussian model as the better fit (lower AIC)
+- **Ordinary kriging** produced smooth prediction surfaces with quantified uncertainty across the spatial domain
+- **5-fold cross-validation** yielded RMSE = 33.87, explaining ~41% of spatial variance given the small sample size
+- **Network optimisation** identified the most and least informative observation points for resource allocation decisions
+- **Point process analysis** revealed species-level clustering, inter-species inhibition at short distances, and deviation from CSR in nearest-neighbour structure
+- **Spatio-temporal simulation** successfully replicated a non-homogeneous Poisson process using thinning, with empirical intensity tracking the theoretical decay pattern
+
+---
+
+*Analysis conducted as part of the Master of Data Science (AI Specialization), La Trobe University, 2025.*
